@@ -1,0 +1,62 @@
+# ── Dependencies ──────────────────────────────────────────
+node_modules/
+.next/
+.nuxt/
+dist/
+build/
+
+# ── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# ── Environment ──────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+.env.production
+
+# ── IDE ──────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Testing ──────────────────────────────────────────────
+coverage/
+.nyc_output/
+htmlcov/
+.pytest_cache/
+.tox/
+
+# ── Docker ───────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Terraform ────────────────────────────────────────────
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# ── Build Artifacts ──────────────────────────────────────
+*.tar.gz
+*.zip

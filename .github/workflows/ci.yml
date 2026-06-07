@@ -1,0 +1,138 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ── Lint ────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Lint Frontend
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run lint
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Lint Backend
+        working-directory: ./backend
+        run: |
+          pip install ruff mypy
+          ruff check .
+          mypy app/ --ignore-missing-imports
+
+  # ── Type Check ──────────────────────────────────────────
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: TypeScript Check
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npx tsc --noEmit
+
+  # ── Unit Tests ──────────────────────────────────────────
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: [lint]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Backend Unit Tests
+        working-directory: ./backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET_KEY: test-secret-key-for-ci-cd-pipeline
+          APP_SECRET_KEY: test-app-secret-key-for-ci-pipeline
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+          pytest app/tests/unit -v --cov=app --cov-report=xml --cov-report=term-missing
+
+      - name: Frontend Unit Tests
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm test -- --coverage
+
+  # ── Security Scan ───────────────────────────────────────
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Frontend Dependency Audit
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+      - name: Backend Dependency Audit
+        working-directory: ./backend
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+  # ── Build ───────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    needs: [unit-tests, type-check]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Frontend
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Backend Docker Image
+        run: |
+          docker build -t agentic-marketplace-backend:${{ github.sha }} ./backend
+
+      - name: Build Frontend Docker Image
+        run: |
+          docker build -t agentic-marketplace-frontend:${{ github.sha }} ./frontend

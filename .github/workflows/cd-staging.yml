@@ -1,0 +1,242 @@
+name: CD — Staging Deployment
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: cd-staging
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend
+  KUBE_NAMESPACE: agentic-marketplace-staging
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Build & Push Images
+  # ──────────────────────────────────────────────
+  build-and-push:
+    name: "Build & Push Images"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      frontend-tag: ${{ steps.meta-frontend.outputs.version }}
+      backend-tag: ${{ steps.meta-backend.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta (frontend)
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=sha,prefix=staging-
+            type=raw,value=staging-latest
+
+      - name: Docker meta (backend)
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=sha,prefix=staging-
+            type=raw,value=staging-latest
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./infrastructure/docker/Dockerfile.frontend
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.STAGING_API_URL }}
+            NEXT_PUBLIC_ENV=staging
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./infrastructure/docker/Dockerfile.backend
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────
+  # Job 2: Database Migrations
+  # ──────────────────────────────────────────────
+  migrate:
+    name: "Database Migrations"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: pip install -r requirements.txt
+
+      - name: Run Alembic migrations
+        working-directory: ./backend
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+
+  # ──────────────────────────────────────────────
+  # Job 3: Deploy to Staging (Blue-Green)
+  # ──────────────────────────────────────────────
+  deploy-staging:
+    name: "Deploy to Staging"
+    runs-on: ubuntu-latest
+    needs: [build-and-push, migrate]
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Set Kubernetes context
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.STAGING_KUBE_CONFIG }}
+
+      - name: Determine active color
+        id: active-color
+        run: |
+          CURRENT=$(kubectl get svc backend -n ${{ env.KUBE_NAMESPACE }} \
+            -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
+          if [ "$CURRENT" = "blue" ]; then
+            echo "deploy_color=green" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_color=blue" >> $GITHUB_OUTPUT
+          fi
+          echo "Current color: $CURRENT"
+          echo "Deploying to: $(cat <<< '${{ steps.active-color.outputs.deploy_color }}')"
+
+      - name: Deploy to inactive color
+        run: |
+          COLOR=${{ steps.active-color.outputs.deploy_color }}
+          SHA=${{ github.sha }}
+          SHORT_SHA=${SHA::8}
+
+          # Apply kustomization with color overlay
+          cd infrastructure/k8s/overlays/staging
+
+          # Update image tags in kustomization
+          kustomize edit set image \
+            ${{ env.FRONTEND_IMAGE }}=${{ env.FRONTEND_IMAGE }}:staging-${SHORT_SHA} \
+            ${{ env.BACKEND_IMAGE }}=${{ env.BACKEND_IMAGE }}:staging-${SHORT_SHA}
+
+          # Apply with color suffix
+          kustomize build . | \
+            sed "s/color: blue/color: ${COLOR}/g" | \
+            kubectl apply -f - -n ${{ env.KUBE_NAMESPACE }}
+
+      - name: Wait for rollout
+        run: |
+          COLOR=${{ steps.active-color.outputs.deploy_color }}
+          kubectl rollout status deployment/backend-${COLOR} \
+            -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/frontend-${COLOR} \
+            -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/celery-worker-${COLOR} \
+            -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          COLOR=${{ steps.active-color.outputs.deploy_color }}
+          # Port-forward to the new color and test
+          kubectl port-forward svc/backend-${COLOR} 8080:8000 \
+            -n ${{ env.KUBE_NAMESPACE }} &
+          sleep 5
+
+          # Health check
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ Health check failed with status $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✅ Health check passed"
+
+          # API readiness check
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/v1/ready)
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ Readiness check failed with status $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✅ Readiness check passed"
+
+          pkill -f "port-forward" || true
+
+      - name: Switch traffic to new color
+        if: success()
+        run: |
+          COLOR=${{ steps.active-color.outputs.deploy_color }}
+          kubectl patch svc backend -n ${{ env.KUBE_NAMESPACE }} \
+            -p "{\"spec\":{\"selector\":{\"color\":\"${COLOR}\"}}}"
+          kubectl patch svc frontend -n ${{ env.KUBE_NAMESPACE }} \
+            -p "{\"spec\":{\"selector\":{\"color\":\"${COLOR}\"}}}"
+          echo "✅ Traffic switched to ${COLOR}"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          COLOR=${{ steps.active-color.outputs.deploy_color }}
+          echo "❌ Deployment failed, rolling back..."
+          kubectl rollout undo deployment/backend-${COLOR} -n ${{ env.KUBE_NAMESPACE }}
+          kubectl rollout undo deployment/frontend-${COLOR} -n ${{ env.KUBE_NAMESPACE }}
+          kubectl rollout undo deployment/celery-worker-${COLOR} -n ${{ env.KUBE_NAMESPACE }}
+
+  # ──────────────────────────────────────────────
+  # Job 4: Notify
+  # ──────────────────────────────────────────────
+  notify:
+    name: "Notify"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ needs.deploy-staging.result }}
+          channel: "#deployments"
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
